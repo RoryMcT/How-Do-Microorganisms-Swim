@@ -1,0 +1,14 @@
+main_phase_shift(40*pi/64)
+for i = 2:6
+    x = graph_output(1,:)
+    y = graph_output(i,:)
+    plot(x,y,'x-','LineWidth',3)
+    title('Three Swimmers With Various Phase Shifts')
+    xlabel('Seperation (bodylengths)')
+    ylabel('Relative Velocity')
+    hold on
+end
+hold on
+x = velocity_output(1,:);
+y = velocity_output(2,:);
+plot(x,y,'x-','LineWidth',3)

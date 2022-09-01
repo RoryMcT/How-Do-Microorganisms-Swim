@@ -1,0 +1,518 @@
+function main(SHIFT, CHANNEL)
+% MAIN  
+%       This version: June 2022
+%
+%   This code demonstrates the use of the method in simulating a
+%   single swimming filament.
+%
+%   It uses the 'EJBb' version of Broyden's method (Algorithm 2 in the
+%   paper) with a reduced 'robot arm' system of nonlinear equations.
+%
+%   To use, just run this script.
+
+
+% Setup
+save_to_file = true;
+graphics = true;
+video = true;
+plot_step = 2;                % Plot every n timesteps
+save_step = 150;                % Save data to file every n timesteps
+
+% Filament data
+a = 1;                        % segment 'radius' (half filament width)
+Num_worm = 5;                     % number of filaments
+Num_seg = 15;                     % number of segments in filament
+tot_seg = Num_worm*Num_seg;                % total number of segments
+Num_lam = Num_worm*(Num_seg - 1);       % number of lambdas
+max_broyden_steps = 3*tot_seg;
+
+steps_per_unit_time = 30;      % steps per oscillation
+num_periods = 10;              % number of periods (unit) times
+concheck_tol = 1e-4;          % Broyden's tolerance
+
+Dist_seg_cent = 2.2*a;                   % distance between segment centres, Delta L
+L = Num_seg*Dist_seg_cent;                   % filament length L
+mu = 1;                       % fluid viscosity
+
+omega = 0.1565; % Frequency of oscillation
+Sp = 10.0; % Sperm number
+T_0 = 11/L/1.2^4*2; %units of curvature
+K_0 = 1; % Dimensionless wavenumber
+
+% Derived parameters -----------------------------------------------
+K = K_0.*2*pi/L;               %   1/L     dimensional wavenumber    
+KB = 4*pi*omega*L^4*mu./Sp.^4; %  FL^2     bending modulus
+KBdivDL = KB/Dist_seg_cent;
+
+period = 2*pi/omega;
+
+filename = ['out-'  datestr(now,'yyyymmdd-HHMMSS') '-Nsw' num2str(Num_worm) ...
+            '-Nw' num2str(Num_seg) '-swim']; % used for data
+                                         % file & video file
+index = 0;
+smallest_sep = 0.15;
+largest_sep = 0.2;
+increment = 0.05;
+size = ((largest_sep-smallest_sep)/increment)+1;
+global velocity_output;
+velocity_output = zeros(2, round(size));
+for sep = smallest_sep: increment: largest_sep
+    index = index + 1;
+    % Set up segment position vectors.
+    %   X_S is x^(j+1), i.e. at next timestep (which we are solving for)
+    %   X   is x^(j),   i.e. at current timestep
+    %   X_T is x^(j-1), i.e. at previous timestep
+    
+    X = zeros(tot_seg,1);         % x-coordinate at current timestep
+    Y = zeros(tot_seg,1);         % y-coordinate
+    THETA = zeros(tot_seg,1);     % rotation
+    TX = cos(THETA);         % tangent vector \hat{t}_x
+    TY = sin(THETA);         % tangent vector \hat{t}_y
+    
+    X_T = zeros(tot_seg,1);       % previous timestep
+    Y_T = zeros(tot_seg,1);
+    THETA_T = zeros(tot_seg,1);
+    
+    X_S = zeros(tot_seg,1);       % next timestep
+    Y_S = zeros(tot_seg,1);
+    THETA_S = zeros(tot_seg,1);
+    
+    % Arrays storing which filament each segment belongs to
+    SW_IND = reshape([1:tot_seg],Num_seg,Num_worm)';
+    
+    % Zero initial phase per worm
+    PHASE = zeros(Num_worm,1);     
+    
+    % Distances between segments and assign phases
+    DL_SW = zeros(Num_worm, Num_seg - 1);
+    for i_sw = 1:Num_worm
+        PHASE(i_sw) = 0; %set to zero -> all the same initial phases
+        DL_SW(i_sw,1) = Dist_seg_cent;
+        for j = 2:Num_seg-1
+            DL_SW(i_sw,j) = Dist_seg_cent;
+        end
+    end
+    
+    % Which filament does segment belong to?
+    % PtoS(n) returns the index of the filament that segment n belongs to.
+    PtoS = zeros(tot_seg, 1);
+    PtoS = floor([0:tot_seg-1]./Num_seg)+1;
+    
+    % Set up position and orientation of first segment in every filament
+    % (We are happy with the default positon of [X,Y]=[0,0] and default
+    %  orientation of THETA=0 but you can change this here.)
+    
+        vertical_spacing = sep*L;
+        for i_sw = 1:Num_worm
+            if i_sw <= Num_worm - 2
+                Y(SW_IND(i_sw,1)) = (i_sw-1)*vertical_spacing;
+            elseif i_sw == Num_worm - 1
+                Y(SW_IND(i_sw,1)) = (0)*vertical_spacing;
+                X(SW_IND(i_sw,1)) = -2.2 * 15;
+            elseif i_sw == Num_worm
+                Y(SW_IND(i_sw,1)) = (i_sw-3)*vertical_spacing;
+                X(SW_IND(i_sw,1)) = -2.2 * 15;
+            end
+        end
+        
+        % Having placed the first segment of each filament and set their
+        % orientation, use robot_arm to construct the position of the remaining
+        % segments. For more, type 'help robot_arm'.
+        [X,Y] = robot_arm(X,Y,THETA,SW_IND,Dist_seg_cent);
+        
+        % Zero the velocities and angular velocities of the segments
+        VX = zeros(tot_seg,1);        % velocity of segment in x-direction
+        VY = zeros(tot_seg,1);        % velocity of segment in y-direction
+        OMEGZ = zeros(tot_seg,1);     % angular velocity of segment (in z-direction)
+        
+        % Zero the forces and torques on the segments
+        FX = zeros(tot_seg,1);        % force on each segment in x-direction
+        FY = zeros(tot_seg,1);        % force on each segment in y-direction
+        TAUZ = zeros(tot_seg,1);      % torque on each segment (in z-direction)
+        
+        % Steric force setup.
+        % For explanation, type 'help collision_barrier'.
+        map = [1 1 1 1]';
+        list = [0:tot_seg-1]';
+        head = tot_seg;
+        Lx_collision = 1000;
+        Ly_collision = 1000;
+        
+        % Initial guesses
+        X_T = X;
+        Y_T = Y;
+        THETA_T = THETA;
+        X_S = X;
+        Y_S = Y;
+        LAMBDA1 = zeros(Num_lam,1);
+        LAMBDA2 = zeros(Num_lam,1);
+        LAMBDA1_0 = zeros(Num_lam,1);
+        LAMBDA2_0 = zeros(Num_lam,1);
+        
+        % Time
+        TOTAL_STEPS = num_periods*steps_per_unit_time;
+        dt = period/steps_per_unit_time;
+        
+        t = 0;
+        plot_now = plot_step - 1;
+        save_now = save_step - 1;
+        
+        % Segment size-related stuff
+        drag_coeff = (6*pi*a);
+        vis_tor_coeff = 8*pi*a^3;
+        RAD = a*ones(tot_seg,1);         % Segment size vector (a = filament thickness)
+        
+        % Newton step Delta X where at iteration k, X_(k+1) = X_k + Delta X
+        DeltaX = zeros(3*tot_seg,1);
+        
+        % Time and iteration counts
+        frame_time = zeros(TOTAL_STEPS,1);
+        iters = zeros(TOTAL_STEPS,1);       % Number of Broyden's iterations
+        running_total_count = 0;            % For average number of Broyden's iters
+        
+        if video
+            Filament_movie = VideoWriter(['output/' filename  '.avi']); % Name it.
+            Filament_movie.FrameRate = 10;  % How many frames per second.
+            open(Filament_movie);
+            framecount = 1;
+        end
+        
+        com_x = zeros(TOTAL_STEPS);
+        
+        idx = reshape(reshape([1:3*tot_seg],tot_seg,3)',3*tot_seg,1);   % For filament indexing
+        
+        J0invERROR_VECk = zeros(3*tot_seg,1);   % J_0^{-1} f(X_k)      in Algorithm 2
+        J0invERROR_VECk1 = zeros(3*tot_seg,1);  % J_0^{-1} f(X_(k+1))  in Algorithm 2
+        
+           TOTAL_STEPS_TO_RUN = TOTAL_STEPS*220/300;
+           for nt = 1:TOTAL_STEPS_TO_RUN
+            iter = 0;
+        
+            p_broy = max_broyden_steps + 1;
+            Cmat = zeros(3*tot_seg,p_broy); % c and d vectors from Alg 2, Line 7. Their
+            Dmat = zeros(3*tot_seg,p_broy); % value at each iteration is stored.
+        
+            % Stop if broken
+            if isnan(X(1))
+                keyboard
+                continue
+            end
+        
+            % Screen output
+            fprintf('\n')
+            if mod(nt,20) == 0
+                fprintf(['[' filename ': rEJBb, RPY, Nsw=' ...
+                         num2str(Num_worm) ', Nw=' num2str(Num_seg) ']\n' ])
+            end
+            length_of_TOTAL_STEPS = max(ceil(log10(abs(TOTAL_STEPS))),1);
+            fprintf([ '   ' ...
+                      'timestep: ' ...
+                      sprintf(['%' num2str(length_of_TOTAL_STEPS) '.f'],nt) ...
+                      '/' num2str(TOTAL_STEPS) ' ' ])
+            frame_start = tic;
+        
+            % X_S is x^(j+1)
+            % X   is x^(j)
+            % X_T is x^(j-1)
+        
+            % Aim of this is to update X_S
+            if(nt == 1)
+                
+                X_S = X;
+                Y_S = Y;
+                THETA_S = THETA;
+                TX_S = cos(THETA_S);
+                TY_S = sin(THETA_S);
+            else
+                % Rearranged linear interpolation as guess for x^(j+1), i.e.
+                % x^j = 0.5*( x^(j-1) + x^(j+1) )
+                THETA_S = 2.0*THETA - THETA_T;
+                TX_S = cos(THETA_S);
+                TY_S = sin(THETA_S);
+                for j_sw = 1:Num_worm
+                    first_bead_index = SW_IND(j_sw,1);
+                    X_S(first_bead_index) = 2*X(first_bead_index) - X_T(first_bead_index);
+                    Y_S(first_bead_index) = 2*Y(first_bead_index) - Y_T(first_bead_index);
+                end
+                % Having guessed first segment in filament, use robot_arm to guess rest
+                [X_S,Y_S] = robot_arm(X_S,Y_S,THETA_S,SW_IND,Dist_seg_cent);
+        
+            end
+        
+            % Find f(X_k) and place into ERROR_VECk.
+            % If ||ERROR_VECk|| < concheck_tol (= epsilon in Alg 2, Line 4),
+            % then concheck = 0. Else, 1.
+            [concheck,ERROR_VECk,VY] = F(X_S,Y_S,TX_S,TY_S,THETA_S,LAMBDA1,LAMBDA2,concheck_tol);
+            % (VY only being outputted here for calculating effective drag later.)
+            KBdivDL = [10000,200,10000];
+            % Find approximate Jacobian J_0
+            J0 = approximate_jacobian_implicit_multiswim_reduced_clever(THETA, LAMBDA1, LAMBDA2, drag_coeff, vis_tor_coeff, dt, Dist_seg_cent, KBdivDL, SW_IND);
+        
+            % Find J_0^{-1} f(X_k)  (from Alg 2, Line 5)
+            J0invERROR_VECk(idx,:) = blockwise_backslash(J0,ERROR_VECk(idx,:),SW_IND);
+        
+            num_broydens_steps_required = 0;
+            while(concheck == 1) % Alg 2, Line 4
+                % Alg 2, Line 5. DeltaX is Delta X in paper.
+                DeltaX = -H_mat_multiply(J0invERROR_VECk, Dmat, Cmat, ERROR_VECk, iter+1);
+        
+                % Update the positions and lambdas
+                THETA_S = THETA_S + DeltaX(2*tot_seg + 1:3*tot_seg);
+                TX_S = cos(THETA_S);
+                TY_S = sin(THETA_S);
+                for j_sw = 1:Num_worm
+                    first_bead_index = SW_IND(j_sw,1);
+                    X_S(first_bead_index) = X_S(first_bead_index) + DeltaX(first_bead_index);
+                    Y_S(first_bead_index) = Y_S(first_bead_index) + DeltaX(tot_seg + first_bead_index);
+                end
+                [X_S,Y_S] = robot_arm(X_S,Y_S,THETA_S,SW_IND,Dist_seg_cent);
+                lambda_locations = 1:2*tot_seg;
+                lambda_locations([1:Num_seg:end]) = [];
+                DeltaX_lambdas = DeltaX(lambda_locations);
+                LAMBDA1 = LAMBDA1 + DeltaX_lambdas(1:tot_seg-Num_worm);
+                LAMBDA2 = LAMBDA2 + DeltaX_lambdas(tot_seg-Num_worm+1:2*tot_seg-2*Num_worm);
+        
+                % Check to see if the new state is an acceptable solution:
+                % ERROR_VECk1 = f(X_(k+1))
+                [concheck, ERROR_VECk1,VY] = F(X_S,Y_S,TX_S,TY_S,THETA_S,LAMBDA1,LAMBDA2,concheck_tol);
+        
+                iter = iter + 1;
+        
+                % (remaining lines are Alg 2, Line 7)
+                y_vec = ERROR_VECk1 - ERROR_VECk;
+        
+                J0invERROR_VECk1(idx,:) = blockwise_backslash(J0,ERROR_VECk1(idx,:),SW_IND);
+        
+                Htimesf = H_mat_multiply(J0invERROR_VECk1, Dmat, Cmat, ERROR_VECk1, iter);
+                y_vec_sq = y_vec'*y_vec;
+                Dmat(:,iter) = Htimesf;
+                Cmat(:,iter) = y_vec/y_vec_sq;
+                ERROR_VECk = ERROR_VECk1;
+                J0invERROR_VECk = J0invERROR_VECk1;
+        
+                % Shout if the iteration count has got a bit high
+                if iter == 100
+                    keyboard
+                    continue
+                end
+        
+                % If the number of iterations maxes out, proceed to next timestep
+                % anyway and see what happens (but flag it with a *)
+                if (iter > max_broyden_steps)
+                    fprintf(' *');
+                    concheck = 0;
+                end
+        
+                num_broydens_steps_required = num_broydens_steps_required + 1;
+                running_total_count = running_total_count + 1;
+            end
+        
+            % Work out velocity of worm 2
+            com_x(nt) = mean(X(Num_seg+1:2*Num_seg));
+            com_y(nt) = mean(Y(Num_seg+1:2*Num_seg));
+           
+            if nt > steps_per_unit_time
+                body_velocity_X = (com_x(nt) - com_x(nt-steps_per_unit_time))/(dt*steps_per_unit_time);
+                body_velocity_Y = (com_y(nt) - com_y(nt-steps_per_unit_time))/(dt*steps_per_unit_time);
+            else
+                body_velocity_X = 0;
+                body_velocity_Y = 0;
+            end
+            if nt == TOTAL_STEPS_TO_RUN
+                velocity_output(1, index) = sep;
+                velocity_output(2, index) = sqrt(abs(body_velocity_X)^2+abs(body_velocity_Y)^2)/0.0296714301359768;
+            end
+    
+        
+            % Step in time, step in time. Never need a reason, never need a rhyme..
+            t = t + dt;
+            X_T = X;
+            Y_T = Y;
+            THETA_T = THETA;
+            X = X_S;
+            Y = Y_S;
+            THETA = THETA_S;
+            TX = cos(THETA);
+            TY = sin(THETA);
+        
+            % At later time steps, you can use a higher order approximation
+            % for the initial guess of the Lagrange multipliers, while storing
+            % the required past ones.
+            if(nt > 10)
+                if(nt == 11)
+                    LAMBDA1_0 = LAMBDA1;
+                    LAMBDA2_0 = LAMBDA2;
+                elseif(nt == 12)
+                    LAMBDA1_T = 2.0*LAMBDA1 - LAMBDA1_0;
+                    LAMBDA2_T = 2.0*LAMBDA2 - LAMBDA2_0;
+        
+                    LAMBDA1_m1 = LAMBDA1_0;
+                    LAMBDA2_m1 = LAMBDA2_0;
+        
+                    LAMBDA1_0 = LAMBDA1;
+                    LAMBDA2_0 = LAMBDA2;
+        
+                    LAMBDA1 = LAMBDA1_T;
+                    LAMBDA2 = LAMBDA2_T;
+                else
+                    LAMBDA1_T = 3.0*LAMBDA1 - 3.0*LAMBDA1_0 + LAMBDA1_m1;
+                    LAMBDA2_T = 3.0*LAMBDA2 - 3.0*LAMBDA2_0 + LAMBDA2_m1;
+        
+                    LAMBDA1_m1 = LAMBDA1_0;
+                    LAMBDA2_m1 = LAMBDA2_0;
+        
+                    LAMBDA1_0 = LAMBDA1;
+                    LAMBDA2_0 = LAMBDA2;
+        
+                    LAMBDA1 = LAMBDA1_T;
+                    LAMBDA2 = LAMBDA2_T;
+                end
+            end
+        
+            % Plot and save
+            plot_now = plot_now + 1;
+            save_now = save_now + 1;
+            if(save_now == save_step && save_to_file)
+                fid = fopen(['output/' filename '.dat'], 'a');
+                if nt == 1
+                    fprintf(fid, 'dt, Nsw (RPY)\n');
+                    fprintf(fid, '%.6e %.6e %.f\n\n', dt, Num_worm);
+                end
+                for j = 1:tot_seg
+                    if mod(j,Num_seg) ~= 0 % i.e. if not the last segment in filament
+                        filament_id = floor(j/Num_seg); %0 to N_sw-1
+                        L1 = LAMBDA1(j-filament_id);
+                        L2 = LAMBDA2(j-filament_id);
+                    else
+                        L1 = 0; L2 = 0;
+                    end
+                    fprintf(fid, ['%.2f %.6f %.6f %.6f %.6f %.6f %.6f '...
+                                  '%.6f %.6f %.6f %.6f %.6f %.6f\n'], ...
+                                 t, X(j), Y(j), TX(j), TY(j), VX(j), VY(j), ...
+                                 OMEGZ(j), FX(j), FY(j), TAUZ(j), L1, L2);
+                end
+                fprintf(fid,'\n');
+                fclose(fid);
+                clf;
+            end
+        
+            if(plot_now == plot_step && graphics)
+                com_X = mean(X_S(1:Num_seg));
+                com_X_all = mean(X_S);
+                com_Y = mean(Y_S(1:Num_seg));
+                for i_sw = 1:Num_worm
+                    plot((X_S(SW_IND(i_sw,:)))/L, (Y_S(SW_IND(i_sw,:)))/L, ...
+                        '-','LineWidth',5);
+                    if i_sw == 1
+                        hold on
+                    end
+                end
+                
+        
+                % Work out quantifiable things about the first filament
+                A_over_L = (max(Y_S(1:Num_seg)) - min(Y_S(1:Num_seg)))/L;
+                title({['nt='  num2str(nt)  ', dt='  num2str(dt)  ...
+                    ', KB=' num2str(KB) ', Sp=' num2str(Sp) ...
+                    ', omega=' num2str(omega) ', T_0=' num2str(T_0) ...
+                    ', K_0=' num2str(K_0) ], ...
+                    ['Worm 1: COM/L=(' num2str(com_X/L) ',' num2str(com_Y/L) ...
+                    '), A/L=' num2str(A_over_L) ', VX/L\omega=' ...
+                    num2str(body_velocity_X/L/omega)]})
+        
+        
+                hold off
+                pbaspect([1 1 1])
+                xlim([com_X_all/L-0.5,com_X_all/L+0.5]);
+                %ylim([com_Y/L-0.5,com_Y/L+0.5]);
+                xlabel('(x-x_{COM})/L');
+                ylabel('(y-y_{COM})/L');
+                axis equal
+        
+                if video == true
+                    frame = getframe(gcf);
+                    writeVideo(Filament_movie,frame);
+                    framecount=framecount+1;
+                end
+                pause(0.01);
+            end
+        
+            if plot_now == plot_step
+                plot_now = 0;
+            end
+            if save_now == save_step
+                save_now = 0;
+            end
+        
+            frame_time(nt) = toc(frame_start);
+            iters(nt) = iter;
+        
+            fprintf(['[' format_time(frame_time(nt)) '|' ...
+                    format_time(mean(frame_time(1:nt))*(TOTAL_STEPS-nt)) ...
+                    '-][#Broy steps: '  num2str(num_broydens_steps_required) ...
+                    '|Avg: '  num2str(round(running_total_count/nt,1))  ']'])
+        
+        end
+        
+        disp('')
+        disp('Run finished')
+        disp(['Total time:' format_time(sum(frame_time))])
+        
+        if video
+            close(Filament_movie);
+        end
+        
+end
+    function [concheck_local,ERROR_VECk1_local,VY] = F(X_S, Y_S, TX_S, TY_S,...
+                                                       THETA_S, LAMBDA1,...
+                                                       LAMBDA2, tol)
+    % F  places forces and torques on the segments, calculates the resultant
+    %    velocities and angular velocities, and forms the error vector f(X*).
+    %    Then checks convergence. For details, see docstrings of functions
+    %    within.
+    
+        FX = zeros(tot_seg,1);
+        FY = zeros(tot_seg,1);
+        TAUZ = zeros(tot_seg,1);
+
+        SHIFT = 0;
+        CHANNEL = true;
+        [TAUZ] = intrinsic_torques(TAUZ, KB, K, Dist_seg_cent, omega, t + dt, T_0, SW_IND, PHASE, SHIFT, CHANNEL);
+        
+        [TAUZ] = elastic_torques(TAUZ, TX_S, TY_S, KB, SW_IND, DL_SW);
+    
+        [FX, FY] = collision_barrier(X_S, Y_S, FX, FY, ...
+                                     Lx_collision, Ly_collision, PtoS, ...
+                                     map, head, list, RAD);
+    
+        [FX, FY, TAUZ] = constraint_forces_torques(FX, FY, TAUZ, TX_S, TY_S,...
+                                             LAMBDA1, LAMBDA2, SW_IND, DL_SW);
+    
+        FZ = zeros(tot_seg,1);
+        TAUX = zeros(tot_seg,1);
+        TAUY = zeros(tot_seg,1);
+        Z_S = zeros(tot_seg,1);
+        [VX,VY,~,~,~,OMEGZ] = RPY(FX,FY,FZ,TAUX,TAUY,TAUZ,X_S,Y_S,Z_S,a,1);
+    
+        
+        % Check convergence between x_(n+1) and x_n, and also check the
+        % constraint. concheck = 0 if all fine, 1 otherwise. The error vectors
+        % are all compiled into ERROR_VECk1_local.
+        [concheck_local, ERROR_VECk1_local] = constraint_check_robot_arm(...
+                                                  X_S, Y_S, THETA_S, ...
+                                                  X, Y, THETA, ...
+                                                  X_T, Y_T, THETA_T, ...
+                                                  VX, VY, OMEGZ, ...
+                                                  Dist_seg_cent, dt, nt, SW_IND, tol);
+        
+    
+    end
+global velocity_output
+velocity_output
+x = velocity_output(1,:);
+y = velocity_output(2,:);
+%plot(x,y,'x-','LineWidth',3)
+%xlabel('Separation (bodylengths)')
+%ylabel('Relative velocity')
+%title('Swimmer in channels of various widths')
+%title('')
+end
